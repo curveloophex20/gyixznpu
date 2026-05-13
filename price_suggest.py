@@ -230,16 +230,23 @@ def classify(name: str, paint_seed: int | None) -> str:
 # Утилиты: метрики из price_history
 # =============================================================================
 def daily_sales_from_history(history, days: int = 30) -> float:
-    """Средние продажи в сутки за последние `days` точек из price_history.
+    """Среднее число продаж в сутки за последние `days` дней.
 
-    history: список объектов с .date (datetime) и .volume (int) — то, что
-    aiosteampy.fetch_price_history возвращает (List[PriceHistoryPoint]).
+    history: список объектов с .date (datetime) и .daily_volume (int) — то,
+    что `aiosteampy.fetch_price_history` возвращает
+    (`List[PriceHistoryEntry]`).
+
+    Делим суммарный объём в окне на `days`, а не на число точек: Steam в
+    последние 24 часа отдаёт почасовые точки + дневные за остальной
+    период, поэтому деление на «количество точек» искусственно занижает
+    результат и расходится с тем, что показывает `i`-команда
+    (`_sum_volume` в item_info.py).
     """
     if not history:
         return 0.0
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     total = 0
-    counted_days = 0
+    found_any = False
     for pt in history:
         d = getattr(pt, "date", None)
         if d is None:
@@ -248,12 +255,15 @@ def daily_sales_from_history(history, days: int = 30) -> float:
             d = d.replace(tzinfo=timezone.utc)
         if d < cutoff:
             continue
-        v = getattr(pt, "volume", 0) or 0
-        total += int(v)
-        counted_days += 1
-    if counted_days == 0:
+        v = getattr(pt, "daily_volume", None) or 0
+        try:
+            total += int(v)
+        except (TypeError, ValueError):
+            continue
+        found_any = True
+    if not found_any or days <= 0:
         return 0.0
-    return total / counted_days
+    return total / float(days)
 
 
 def week_pct_from_history(history) -> float | None:
