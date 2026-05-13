@@ -128,19 +128,25 @@ async def path_b_suggest(
 ) -> PathBSuggestion:
     """Авто-цена для скина с флоатом (не редкий паттерн).
 
-    Делает POST на market-эндпоинт с фильтрами quality/exterior + float_max.
-    Возвращает суггест в центах + reason.
+    Делает POST на market-эндпоинт с фильтрами quality + float ∈ [0.0, our_float * 1.10].
+    Exterior-тег (FN/MW/FT/...) намеренно НЕ используем: иначе у FT-скина фильтр
+    обрежет листинги до FT (min float ≈ 0.15) и мы пропустим более дешёвые
+    FN/MW-листинги с лучшим флоатом, которые уже конкурируют за того же покупателя.
+
+    Возвращает суггест в центах + reason. Параметр `exterior_tag` оставлен ради
+    обратной совместимости и игнорируется.
     """
     # Локальный импорт чтобы не тянуть item_info на верхний уровень.
     import item_info
 
+    # Не обрезаем снизу по флоату (0.0): если есть FN/MW с флоатом
+    # лучше нашего — они реальные конкуренты по цене.
     f_max = max(0.0, min(1.0, our_float * 1.10))
 
     category_filters: dict[str, list[str]] = {}
     if quality_tag:
         category_filters["category_730_Quality"] = [quality_tag]
-    if exterior_tag:
-        category_filters["category_730_Exterior"] = [exterior_tag]
+    # exterior_tag намеренно не добавляем — см. docstring.
 
     data = await item_info._fetch_listings_page(  # noqa: SLF001
         session,
