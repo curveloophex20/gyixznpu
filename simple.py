@@ -5599,6 +5599,10 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
             f"   {idx:<3} {who[:14]:<14} {fl_str:>7} {seed_str:>5} "
             f"{cents_str:>10}  {path}    {reason}"
         )
+        # Троттлим между POST'ами path_b_suggest к Steam Market — без
+        # паузы большая группа флоатов бьёт endpoint пачкой и Steam ловит 429.
+        if path == "B" and idx < len(group):
+            await asyncio.sleep(0.5)
 
     while True:
         print(
