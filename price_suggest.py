@@ -168,21 +168,26 @@ async def path_b_suggest(
             None, f"нет листингов с float ≤ {f_max:.4f}"
         )
 
-    # Цена первого = минимум. Steam уже отсортировал ASC.
-    try:
-        min_price = int(listings[0].get("unPricePerUnit") or 0)
-    except (TypeError, ValueError):
-        min_price = 0
+    # Берём buyer-facing цену = unPricePerUnit + unFeePerUnit. unPricePerUnit один —
+    # это сколько ПОЛУЧИТ продавец после комиссии Steam (~15%), а нам
+    # нужна цена «для покупателя» — та же, что показывает Market UI и которую
+    # бот передаёт в place_sell_listing(price=...).
+    def _buyer_price(li: dict) -> int:
+        try:
+            return (int(li.get("unPricePerUnit") or 0)
+                    + int(li.get("unFeePerUnit") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    # Steam уже отсортировал listings по цене ASC — первый = минимум.
+    min_price = _buyer_price(listings[0])
     if min_price <= 0:
         return PathBSuggestion(None, "не смог распарсить min_price")
 
     # Считаем qty на min-price — листинги уже отсортированы по цене ASC.
     qty_at_min = 0
     for li in listings:
-        try:
-            p = int(li.get("unPricePerUnit") or 0)
-        except (TypeError, ValueError):
-            continue
+        p = _buyer_price(li)
         if p == min_price:
             qty_at_min += 1
         else:
