@@ -133,6 +133,13 @@ async def path_b_suggest(
     обрежет листинги до FT (min float ≈ 0.15) и мы пропустим более дешёвые
     FN/MW-листинги с лучшим флоатом, которые уже конкурируют за того же покупателя.
 
+    Логика выбора цены:
+      1. Фильтруем листинги с price=0 (баг Steam).
+      2. Если первый валидный листинг < 25% от второго — outlier (опечатка/
+         дампер), скипаем и берём следующий.
+      3. min_price = buyer-facing цена оставшегося первого листинга.
+      4. suggest = min_price − 0.01 (always undercut, без условий по daily).
+
     Возвращает суггест в центах + reason. Параметр `exterior_tag` оставлен ради
     обратной совместимости и игнорируется.
     """
@@ -179,38 +186,50 @@ async def path_b_suggest(
         except (TypeError, ValueError):
             return 0
 
-    # Steam уже отсортировал listings по цене ASC — первый = минимум.
-    min_price = _buyer_price(listings[0])
+    # Steam иногда возвращает листинги с price=0 (баг) — фильтруем их,
+    # иначе min_price=0 и весь Path B падает с "не смог распарсить".
+    valid = [li for li in listings if _buyer_price(li) > 0]
+    zero_skipped = len(listings) - len(valid)
+    if not valid:
+        return PathBSuggestion(
+            None, "все листинги с нулевой ценой (Steam bug)"
+        )
+
+    # Outlier-защита от дамперов/опечаток: если первый валидный листинг
+    # резко дешевле второго (порог: < 25% от второго) — пропускаем его
+    # как outlier и берём следующий.
+    outlier_skipped: int | None = None
+    if len(valid) >= 2:
+        p1 = _buyer_price(valid[0])
+        p2 = _buyer_price(valid[1])
+        # p1 * 4 < p2 эквивалентно p1 < p2 * 0.25 без float-арифметики.
+        if p1 * 4 < p2:
+            outlier_skipped = p1
+            valid = valid[1:]
+
+    min_price = _buyer_price(valid[0])
     if min_price <= 0:
         return PathBSuggestion(None, "не смог распарсить min_price")
 
-    # Считаем qty на min-price — листинги уже отсортированы по цене ASC.
+    # qty_at_min — для информации в reason'е. По новой логике always undercut
+    # она цену больше не определяет (раньше зависело от daily_sales).
     qty_at_min = 0
-    for li in listings:
-        p = _buyer_price(li)
-        if p == min_price:
+    for li in valid:
+        if _buyer_price(li) == min_price:
             qty_at_min += 1
         else:
             break
 
-    # Если на странице 20 листингов и все по min — стенка ≥ 20, точное число
-    # неизвестно, но Steam отсортировал по asc и страница забита одним уровнем.
-    page_full_at_min = (qty_at_min == len(listings)) and len(listings) >= 20
-
-    if (
-        not page_full_at_min
-        and daily_sales > 0
-        and qty_at_min < daily_sales
-    ):
-        return PathBSuggestion(
-            min_price,
-            f"match min={min_price/100:.2f} (qty {qty_at_min} < daily {daily_sales:.0f})",
-        )
-
-    return PathBSuggestion(
-        max(1, min_price - 1),
-        f"undercut min={min_price/100:.2f} −0.01 (qty {qty_at_min} ≥ daily-wall)",
-    )
+    suggest = max(1, min_price - 1)
+    parts = [
+        f"undercut min={min_price/100:.2f} −0.01 "
+        f"(qty {qty_at_min}, daily {daily_sales:.0f})"
+    ]
+    if zero_skipped:
+        parts.append(f"skip {zero_skipped}× price=0")
+    if outlier_skipped is not None:
+        parts.append(f"skip outlier={outlier_skipped/100:.2f}")
+    return PathBSuggestion(suggest, "; ".join(parts))
 
 
 # =============================================================================
