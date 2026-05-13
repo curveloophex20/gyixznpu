@@ -1908,7 +1908,7 @@ def _print_inventory_item(
 
 
 async def _ask_price_cents(
-    prompt: str, *, i_callback=None, a_callback=None,
+    prompt: str, *, i_callback=None, a_callback=None, cur_sym: str = "",
 ) -> int | None:
     """Спросить цену типа `1.99`/`1,99` — вернёт центы (int) или None.
 
@@ -1944,7 +1944,11 @@ async def _ask_price_cents(
                 print("   [!] авто-цена не смогла подобрать — введи цену вручную.")
                 continue
             cents_a, reason, path = sug
-            print(f"   ► Авто-цена (Path {path}): {cents_a / 100:.2f}  ({reason})")
+            sym_part = f" {cur_sym}" if cur_sym else ""
+            print(
+                f"   ► Авто-цена (Path {path}): "
+                f"{cents_a / 100:.2f}{sym_part}  ({reason})"
+            )
             confirm = (await _ask(
                 "   [y=принять / число=ввести своё / q=отмена]: "
             )).strip().lower().replace(",", ".")
@@ -2062,6 +2066,7 @@ async def _list_item_action(
             + " (1.99, i=инфо/график, a=авто-цена, q/b/Enter — назад): ",
             i_callback=info_cb,
             a_callback=auto_cb,
+            cur_sym=_currency_symbol(currency_enum, currency_code) if currency_code else "",
         )
         if cents is None:
             print("   Отменено.")
@@ -2439,6 +2444,7 @@ async def _bulk_list_group(
         + " (например 1.99, i=инфо/график, a=авто-цена, q/b/Enter — назад): ",
         i_callback=info_cb,
         a_callback=auto_cb,
+        cur_sym=_currency_symbol(currency_enum, currency_code) if currency_code else "",
     )
     if cents is None:
         print("   Отменено, возвращаемся в инвентарь.")
@@ -5440,6 +5446,77 @@ def _account_currency_code(
     return None
 
 
+async def _auto_price_show_filter_listings(  # noqa: PLR0913
+    client,
+    app_id: int,
+    gid: str,
+    *,
+    quality_tag: str | None,
+    our_float: float,
+    our_seed: int | None,
+    currency_code: int,
+    cur_sym: str,
+    name: str,
+) -> None:
+    """Печатает листинги, отфильтрованные теми же параметрами что path_b_suggest.
+
+    Команда `i <N>` в авто-подборе цены — чтобы видеть, какие конкретно
+    листинги Steam отдаёт под фильтром (quality + float ∈ [0, our_float*1.10],
+    без exterior) и почему авто-цена выдала именно такую цифру.
+    """
+    try:
+        import item_info as _ii
+    except ImportError as exc:  # pragma: no cover
+        print(f"   [BUG] item_info не загружен: {exc}")
+        return
+
+    f_max = max(0.0, min(1.0, our_float * 1.10))
+    cat_f: dict[str, list[str]] = {}
+    if quality_tag:
+        cat_f["category_730_Quality"] = [quality_tag]
+
+    print()
+    print(f"   === Листинги под path_b-фильтром: «{name}» ===")
+    seed_part = f", seed={our_seed}" if our_seed is not None else ""
+    print(
+        f"   quality={quality_tag or '—'}  "
+        f"float ∈ [0.0000, {f_max:.4f}]  (наш={our_float:.4f}{seed_part})"
+    )
+
+    try:
+        data = await _ii._fetch_listings_page(  # noqa: SLF001
+            client.session, app_id, gid,
+            start=0, sort_field=0, sort_dir=0,
+            category_filters=cat_f or None,
+            wear_range=(0.0, f_max),
+            currency_code=currency_code,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] POST упал: {type(exc).__name__}: {exc}")
+        return
+    if not data:
+        print("   [!] POST вернул пусто.")
+        return
+    parsed = _ii._parse_listings_v2(data)  # noqa: SLF001
+    total = int(data.get("total_count") or len(parsed))
+    if not parsed:
+        print(f"   [!] под фильтром листингов нет (total_count={total}).")
+        return
+
+    print(f"   Найдено {len(parsed)} (показываю до 20) из total≈{total}.")
+    print(f"   {'#':<3} {'price':>12} {'float':>8} {'seed':>6}")
+    print("   " + "-" * 35)
+    for i, li in enumerate(parsed[:20], 1):
+        price = li.get("price_cents") or 0
+        fl = li.get("float")
+        sd = li.get("paint_seed")
+        price_str = f"{price/100:.2f} {cur_sym}"
+        fl_str = f"{fl:.4f}" if isinstance(fl, (int, float)) else "—"
+        sd_str = str(sd) if isinstance(sd, int) else "—"
+        marker = " *" if our_seed is not None and sd == our_seed else "  "
+        print(f"  {marker}{i:<3} {price_str:>12} {fl_str:>8} {sd_str:>6}")
+
+
 async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
     client,
     currency_enum,
@@ -5555,7 +5632,7 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
     print()
     print(
         f"   {'#':<3} {'acc':<14} {'float':>7} {'seed':>5} "
-        f"{'suggest':>10} path  reason"
+        f"{'suggest':>10} {'cur':<4}path  reason"
     )
     print("   " + "-" * 90)
     for idx, c in enumerate(group, 1):
@@ -5597,7 +5674,7 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
         seed_str = str(seed) if seed is not None else "—"
         print(
             f"   {idx:<3} {who[:14]:<14} {fl_str:>7} {seed_str:>5} "
-            f"{cents_str:>10}  {path}    {reason}"
+            f"{cents_str:>10} {cur_sym:<4}{path}    {reason}"
         )
         # Троттлим между POST'ами path_b_suggest к Steam Market — без
         # паузы большая группа флоатов бьёт endpoint пачкой и Steam ловит 429.
@@ -5606,8 +5683,8 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
 
     while True:
         print(
-            "\n   [y=выставить, edit <N> <price>=поправить, skip <N>=исключить, "
-            "n=отменить]: ",
+            "\n   [y=выставить, edit <N> <price>=поправить, "
+            "i <N>=листинги под фильтром, skip <N>=исключить, n=отменить]: ",
             end="",
         )
         ans = (await _ask("")).strip()
@@ -5647,6 +5724,31 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
             suggestions[n - 1]["reason"] = "(ручная правка)"
             print(f"   [ok] {n}: {new_cents/100:.2f} {cur_sym}")
             continue
+        if len(parts) == 2 and parts[0].lower() == "i":
+            try:
+                n = int(parts[1])
+            except ValueError:
+                print("   [!] формат: i <N>.")
+                continue
+            if not 1 <= n <= len(suggestions):
+                print(f"   [!] N должен быть 1..{len(suggestions)}.")
+                continue
+            s = suggestions[n - 1]
+            row = s["row"]
+            pw_i = row.get("paint_wear")
+            if pw_i is None:
+                print("   [!] у предмета нет paint_wear — Path B info недоступна.")
+                continue
+            seed_i = row.get("paint_seed")
+            await _auto_price_show_filter_listings(
+                client, app_id, gid,
+                quality_tag=q_tag,
+                our_float=float(pw_i),
+                our_seed=int(seed_i) if seed_i is not None else None,
+                currency_code=currency_code, cur_sym=cur_sym,
+                name=name,
+            )
+            continue
         if len(parts) == 2 and parts[0].lower() == "skip":
             try:
                 n = int(parts[1])
@@ -5659,7 +5761,7 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
             suggestions[n - 1]["skip"] = True
             print(f"   [ok] #{n} пропущен.")
             continue
-        print(f"   [!] не понял «{ans}». Команды: y / edit N PRICE / skip N / n.")
+        print(f"   [!] не понял «{ans}». Команды: y / edit N PRICE / i N / skip N / n.")
 
 
 async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
