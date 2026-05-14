@@ -519,12 +519,35 @@ def record_history_events(
     return added
 
 
+def _dump_description_entry(entry) -> dict:
+    """Все поля одной HTML-/text-записи описания, какие вытащит aiosteampy.
+
+    PR #9: для дебага trade-hold-парсинга важны минимум `value`, `color`,
+    `name`, `type` — атрибут «Tradable/Marketable After …» имеет
+    `color=ff4040`, `name=attribute`.
+    """
+    return {
+        "value": getattr(entry, "value", None),
+        "color": getattr(entry, "color", None),
+        "name": getattr(entry, "name", None),
+        "type": getattr(entry, "type", None),
+    }
+
+
 def _item_extra_json(item) -> str | None:
-    """Сериализует raw `properties` + `descriptions` предмета в JSON.
+    """Сериализует raw `properties` + `descriptions` + `owner_descriptions`
+    + marketable-флаги предмета в JSON.
 
     Это нужно для дебага — Steam периодически меняет схему ответа (например,
     добавляет новые propertyid под чармы), и без сырого дампа сложно понять,
     почему наш парсер не нашёл то, что должен. Пишем в `inventory_cache.extra_json`.
+
+    PR #9: добавили `owner_descriptions` (где Steam держит «Tradable/Marketable
+    After …»), `marketable`/`market_tradable_restriction`/
+    `market_marketable_restriction` (флаги market-cooldown) и `tradable_after`
+    (то, что aiosteampy реально вытащил в bare поле — None vs datetime).
+    Полные поля каждой description-записи (name/type/color/value) — чтобы
+    видеть как aiosteampy парсит ответ Steam.
     """
     try:
         props = []
@@ -540,14 +563,24 @@ def _item_extra_json(item) -> str | None:
             )
         descr = getattr(item, "description", None)
         descriptions = []
+        owner_descriptions = []
+        marketable_flags = {}
         if descr is not None:
             for entry in getattr(descr, "descriptions", None) or ():
-                descriptions.append(
-                    {
-                        "value": getattr(entry, "value", None),
-                        "color": getattr(entry, "color", None),
-                    }
-                )
+                descriptions.append(_dump_description_entry(entry))
+            for entry in getattr(descr, "owner_descriptions", None) or ():
+                owner_descriptions.append(_dump_description_entry(entry))
+            marketable_flags = {
+                "marketable": getattr(descr, "marketable", None),
+                "tradable": getattr(descr, "tradable", None),
+                "commodity": getattr(descr, "commodity", None),
+                "market_tradable_restriction": getattr(
+                    descr, "market_tradable_restriction", None
+                ),
+                "market_marketable_restriction": getattr(
+                    descr, "market_marketable_restriction", None
+                ),
+            }
         tags = []
         if descr is not None:
             for tag in getattr(descr, "tags", None) or ():
@@ -559,7 +592,14 @@ def _item_extra_json(item) -> str | None:
                     }
                 )
         return json.dumps(
-            {"properties": props, "descriptions": descriptions, "tags": tags},
+            {
+                "properties": props,
+                "descriptions": descriptions,
+                "owner_descriptions": owner_descriptions,
+                "marketable_flags": marketable_flags,
+                "tradable_after_raw": getattr(item, "tradable_after", None),
+                "tags": tags,
+            },
             ensure_ascii=False,
             default=str,
         )

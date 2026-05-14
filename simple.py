@@ -1004,7 +1004,12 @@ async def _auto_suggest_price(
             return None
         return (sug.cents, sug.reason, "B")
 
-    # Path A: используем histogram (sell_order_table).
+    # Path A: берём ПОЛНЫЙ sell-стакан из `sell_order_graph` (до ~100
+    # уровней с реальными qty per price). `sell_order_table` отдаёт только
+    # топ-6 уровней, причём последняя строка — синтетический «всё ≥ X»
+    # bucket (например, 47.77 NOK qty=14395). Это создавало ложную «стену»
+    # на 47.77 при том что реально на каждом конкретном уровне ≥47.77 лежит
+    # по 1-2 копии (см. PR #5).
     nameid = await _ii.resolve_item_nameid(client, app_id, name)
     if nameid is None:
         print("   [!] item_nameid не получен — Path A без histogram не работает.")
@@ -1015,14 +1020,16 @@ async def _auto_suggest_price(
         print(f"   [!] histogram недоступен: {type(exc).__name__}: {exc}")
         return None
 
-    sell_table = []
-    for row in histogram.sell_order_table or ():
-        p = getattr(row, "price", None)
-        q = getattr(row, "quantity", None)
-        if p is not None and q is not None:
-            sell_table.append((int(p), int(q)))
+    sell_table = _ii._graph_to_deltas(histogram.sell_order_graph)
     if not sell_table:
-        print("   [!] sell_order_table пустой.")
+        # Fallback: graph пустой (редкий случай) — пробуем table.
+        for row in histogram.sell_order_table or ():
+            pr = getattr(row, "price", None)
+            qt = getattr(row, "quantity", None)
+            if pr is not None and qt is not None:
+                sell_table.append((int(pr), int(qt)))
+    if not sell_table:
+        print("   [!] sell-стакан пустой.")
         return None
     sug = _ps.path_a_suggest(sell_table, daily, week)
     if sug.cents is None:
@@ -1861,6 +1868,118 @@ def _is_trade_protected(item, *, protected_asset_ids: set[str] | None = None) ->
     return False
 
 
+# EN: «Tradable/Marketable After May 21, 2026 (7:00:00) GMT»
+_TRADABLE_AFTER_RE_EN = re.compile(
+    r"Tradable(?:\s*/\s*Marketable)?\s+After\s+"
+    r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})\s+"
+    r"\((\d{1,2}):(\d{1,2}):(\d{1,2})\)\s+GMT",
+    re.IGNORECASE,
+)
+# RU: «Можно будет продать или передать после 21 май 2026 (7:00:00) GMT»
+_TRADABLE_AFTER_RE_RU = re.compile(
+    r"после\s+(\d{1,2})\s+([а-яёА-ЯЁ]+)\s+(\d{4})\s+"
+    r"\((\d{1,2}):(\d{1,2}):(\d{1,2})\)\s+GMT",
+    re.IGNORECASE,
+)
+_TRADABLE_AFTER_MONTHS = {
+    # English
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    # Russian — Steam отдаёт «май», «мая», «март», «марта» и т.п.
+    # Достаточно первых 3 символов, кроме «ма*» — там 3 буквы решающе:
+    # «мар»=март, «май»=май, «мая»=май.
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4,
+    "май": 5, "мая": 5,
+    "июн": 6, "июл": 7, "авг": 8, "сен": 9,
+    "окт": 10, "ноя": 11, "дек": 12,
+}
+
+
+def _parse_tradable_after_from_descriptions(descr) -> datetime | None:
+    """Найти и распарсить дату разлока из HTML-атрибута в описании.
+
+    Steam отдаёт дату разлока в HTML-атрибуте предмета (`color=ff4040`)
+    в локализованном виде, в зависимости от языка аккаунта:
+      EN: «Tradable/Marketable After May 21, 2026 (7:00:00) GMT»
+      RU: «Можно будет продать или передать после 21 май 2026 (7:00:00) GMT»
+
+    На некоторых аккаунтах aiosteampy 0.7 не вытаскивает эту дату в
+    `EconItem.tradable_after` (см. PR #9 диагностику в extra_json).
+
+    На реальных CS2-предметах атрибут лежит в `owner_descriptions`
+    (видно только владельцу), но Steam иногда дублирует его и в
+    `descriptions` — проверяем оба поля.
+
+    Возвращает datetime в UTC, либо None если не нашли / не распарсили.
+    """
+    if descr is None:
+        return None
+    for attr in ("owner_descriptions", "descriptions"):
+        entries = getattr(descr, attr, None) or ()
+        for d in entries:
+            v = getattr(d, "value", None) or ""
+            if not v:
+                continue
+            parsed = _try_parse_unlock_date(v)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _try_parse_unlock_date(text: str) -> datetime | None:
+    """Применяет EN / RU regex'ы. Возвращает datetime или None."""
+    # EN: «Tradable/Marketable After May 21, 2026 (7:00:00) GMT»
+    if "GMT" in text and "After" in text:
+        m = _TRADABLE_AFTER_RE_EN.search(text)
+        if m is not None:
+            month_str, day, year, hh, mm, ss = m.groups()
+            return _build_dt(month_str, day, year, hh, mm, ss)
+    # RU: «... после <day> <month_ru> <year> (HH:MM:SS) GMT»
+    if "GMT" in text and "после" in text.lower():
+        m = _TRADABLE_AFTER_RE_RU.search(text)
+        if m is not None:
+            day, month_str, year, hh, mm, ss = m.groups()
+            return _build_dt(month_str, day, year, hh, mm, ss)
+    return None
+
+
+def _build_dt(month_str: str, day, year, hh, mm, ss) -> datetime | None:
+    """Превращает 3-буквенный префикс месяца + числа в UTC datetime."""
+    month = _TRADABLE_AFTER_MONTHS.get(month_str[:3].lower())
+    if month is None:
+        return None
+    try:
+        return datetime(
+            int(year), month, int(day),
+            int(hh), int(mm), int(ss),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def _effective_tradable_after(item) -> datetime | None:
+    """`item.tradable_after`, иначе парсим из `description.descriptions`.
+
+    Кеширует результат в `item.tradable_after`, чтобы:
+      1) cache.record_inventory (читает getattr(it, "tradable_after"))
+         тоже получил дату.
+      2) Не парсить regex повторно для одного и того же предмета.
+    """
+    ta = getattr(item, "tradable_after", None)
+    if ta is not None:
+        return ta
+    parsed = _parse_tradable_after_from_descriptions(
+        getattr(item, "description", None)
+    )
+    if parsed is not None:
+        try:
+            item.tradable_after = parsed
+        except (AttributeError, TypeError):
+            pass  # frozen / slotted — ладно, просто вернём дату
+    return parsed
+
+
 def _inventory_state(
     item,
     listed_asset_ids: set[str] | None = None,
@@ -1869,7 +1988,15 @@ def _inventory_state(
     """Одно из: 'on_market' / 'trade_protect' / 'trade_hold' / 'free'.
 
     Порядок проверки: на маркете → trade-protect (новый context=16) →
-    trade-hold (после покупки с тп). Если ничего из этого — 'free'.
+    trade-hold (после покупки с тп / market-hold). Если ничего из этого
+    — 'free'.
+
+    Trade-hold определяется по «эффективной» дате разлока
+    (_effective_tradable_after): сначала `item.tradable_after` от
+    aiosteampy, иначе — парсим строку «Tradable/Marketable After
+    <date> GMT» из `description.descriptions` (PR #9). На некоторых
+    аккаунтах aiosteampy 0.7 не парсит дату в bare поле, хотя Steam
+    отдаёт её в HTML-атрибуте.
 
     На маркете перебивает остальное: Steam иногда возвращает «фейковый»
     tradable_after для уже выставленных предметов — это его косяк, наш
@@ -1879,7 +2006,7 @@ def _inventory_state(
         return "on_market"
     if _is_trade_protected(item, protected_asset_ids=protected_asset_ids):
         return "trade_protect"
-    if getattr(item, "tradable_after", None) is not None:
+    if _effective_tradable_after(item) is not None:
         return "trade_hold"
     return "free"
 
@@ -1911,7 +2038,7 @@ def _format_trade_hold(item) -> str:
     """Маркер trade-hold/trade-protect для предмета, без учёта on-market."""
     state = _inventory_state(item)
     if state in ("trade_protect", "trade_hold"):
-        return _format_state_marker(state, getattr(item, "tradable_after", None))
+        return _format_state_marker(state, _effective_tradable_after(item))
     return ""
 
 
@@ -1930,7 +2057,7 @@ def _print_inventory_item(
     state = _inventory_state(item, listed_asset_ids, protected_asset_ids)
     # Если предмет на маркете — Steam иногда отдаёт «фейковый» tradable_after
     # как часть листинга. Игнорируем его и печатаем только [на маркете].
-    state_part = _format_state_marker(state, getattr(item, "tradable_after", None))
+    state_part = _format_state_marker(state, _effective_tradable_after(item))
     if not with_cs2_extras:
         print(f"   {i:>3}. {name}{amount_part}{state_part}")
         return
@@ -2078,7 +2205,7 @@ async def _list_item_action(
             return
 
         if _is_trade_protected(item, protected_asset_ids=protected_asset_ids):
-            ta = getattr(item, "tradable_after", None)
+            ta = _effective_tradable_after(item)
             when = ta.strftime("%Y-%m-%d %H:%M UTC") if ta else "?"
             print(
                 f"   «{name}» под Trade Protection до {when} — выставить нельзя.\n"
@@ -2338,7 +2465,7 @@ def _group_inventory(
             worst_hold = None
             min_hold = None
             for it in lst:
-                ta = getattr(it, "tradable_after", None)
+                ta = _effective_tradable_after(it)
                 if ta is None:
                     continue
                 if worst_hold is None or ta > worst_hold:
@@ -3536,13 +3663,17 @@ async def _fetch_public_inventory_asset_ids(  # noqa: PLR0912, C901
     через `start_assetid` из `more_items`, max 10 страниц.
 
     Возвращает:
-        (set, None)        — успех
+        (set, None)        — успех (есть assets; ИЛИ 200 success=1 без
+                              assets — инвентарь публичный, видимых = 0;
+                              hidden_from_public diff корректно поставит
+                              все приватные asset_id как hidden).
         (None, "HTTP 401") — профиль приватный или Steam режект
         (None, "HTTP 429") — rate-limit
         (None, "HTTP 5xx") — Steam-серверная ошибка
         (None, "timeout")  — сетевой таймаут
         (None, "net:XXX")  — другая сетевая ошибка
-        (None, "private")  — 200, но JSON без assets (профиль скрыл инвентарь)
+        (None, "private")  — 200 с success != 1 (профиль скрыл инвентарь
+                              на уровне Steam-привата).
 
     `proxy`: опционально HTTP/SOCKS прокси.
     """
@@ -3632,9 +3763,30 @@ async def _fetch_public_inventory_asset_ids(  # noqa: PLR0912, C901
                 if not isinstance(data, dict):
                     return (None, "not-json")
                 assets = data.get("assets")
-                # Профиль публичный, но инвентарь спрятан → 200, assets=None.
+                # 200 без `assets` — нужно различать:
+                #   success=1 + total_inventory_count is not None
+                #     → инвентарь публичный, но Steam ограничил выдачу
+                #       (rwgrsn=-2 / display-restriction). НЕ приватный.
+                #   иначе → приватный/странный ответ.
                 if assets is None:
-                    return (out if out else None, "private" if not out else None)
+                    if out:
+                        # На промежуточных страницах assets=None означает «больше
+                        # ничего нет» — успех, что уже собрали.
+                        return (out, None)
+                    success = data.get("success")
+                    total_count = data.get("total_inventory_count")
+                    if success == 1 and total_count is not None:
+                        # 200 success=1 без `assets` — инвентарь публичный,
+                        # просто Steam не отдал ни одного предмета через
+                        # web-API. Считаем «видимых = 0» → возвращаем пустой
+                        # set. В sweep это даст diff = priv_ids \ {} = всё
+                        # приватное, и все эти asset_id'ы попадут в
+                        # «hidden_from_public» (= «недавно разлочены ≤3 дня»).
+                        # Это сознательный выбор по запросу юзера: инвентарь
+                        # публичный, значит расхождение между нашим API-видом
+                        # и публичным = display cooldown.
+                        return (set(), None)
+                    return (None, "private")
                 for a in assets:
                     aid = a.get("assetid") or a.get("asset_id")
                     if aid:
@@ -3698,6 +3850,11 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
         "inventories": {},
         "history_added": 0,
         "errors": [],
+        # `warnings` — мягкие сообщения, которые НЕ роняют sweep в FAIL.
+        # Пример: «public-restricted» — инвентарь публичный, но Steam ограничил
+        # выдачу listing'ов через web-API (rwgrsn=-2). diff hidden_from_public
+        # пропускается, но это не приватный профиль.
+        "warnings": [],
     }
 
     # 1. login (или reuse из sessions). Если задан proxy — НЕ берём из sessions
@@ -4103,15 +4260,35 @@ async def _ask_use_proxy(operation_label: str) -> list[str]:
     return []
 
 
-async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) -> None:
+async def _run_sweep(
+    accounts: list[dict],
+    sessions: dict,
+    force_relogin: bool,
+    *,
+    filter_label_nums: set[int] | None = None,
+) -> None:
     """Запускает sweep по всем аккаунтам последовательно с прогрессом.
 
     Аккаунты сортируются тем же ключом, что и в `_pick_account`: сначала по
     числовому label по возрастанию (1, 2, 3, ..., 21, 22, ...), потом всё
     остальное по username. Раньше порядок шёл по `sub.name` из `iterdir`,
     т.е. лексикографически — поэтому 21 стоял раньше 5.
+
+    `filter_label_nums` (PR #6): если задан, sweep'имся только по аккаунтам,
+    у которых `_label_num(acc)` входит в это множество. Используется для
+    выборочного sweep'а из меню — `r 35`, `r 1,5,7`, `r 1-10`. Аккаунты
+    без label_num (label не число) пропускаются.
     """
     accounts = _sort_accounts(accounts)
+    if filter_label_nums is not None:
+        wanted = set(filter_label_nums)
+        accounts = [a for a in accounts if _label_num(a) in wanted]
+        missing = wanted - {_label_num(a) for a in accounts}
+        if missing:
+            print(f"   [!] Не найдено: {sorted(missing)}")
+        if not accounts:
+            print("   [!] После фильтра не осталось аккаунтов — sweep не запускаем.")
+            return
     print("\n" + "=" * 120)
     print(f"   SWEEP — {len(accounts)} аккаунт(а/ов). Последовательно. Прерывание — Ctrl-C.")
     print("=" * 120)
@@ -4234,15 +4411,19 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
             n_total = sum(hidden_map.values())
             if n_total > 0:
                 hidden_summary = f"  hidden={n_total}"
+        warns = res.get("warnings") or []
+        warn_summary = f"  warn: {'; '.join(warns)}" if warns else ""
         if res["ok"]:
             print(
                 f"{prefix}  OK  bal={bal_str}  orders={res['orders']}  "
-                f"inv: {inv_summary}  history+{res['history_added']}{hidden_summary}"
+                f"inv: {inv_summary}  history+{res['history_added']}"
+                f"{hidden_summary}{warn_summary}"
             )
         else:
             print(
                 f"{prefix}  FAIL  bal={bal_str}  orders={res['orders']}  "
                 f"inv: {inv_summary}  errors: {'; '.join(res['errors'])}"
+                f"{warn_summary}"
             )
         # Failover: если sweep вернул FAIL (но не по таймауту — таймауты уже
         # отыграли свой ретрай-цикл выше) и есть прокси — метим bad. На OK —
@@ -5619,16 +5800,19 @@ async def _auto_price_show_filter_listings(  # noqa: PLR0913
     """Печатает листинги, отфильтрованные теми же параметрами что path_b_suggest.
 
     Команда `i <N>` в авто-подборе цены — чтобы видеть, какие конкретно
-    листинги Steam отдаёт под фильтром (quality + float ∈ [0, our_float*1.10],
-    без exterior) и почему авто-цена выдала именно такую цифру.
+    листинги Steam отдаёт под фильтром (quality + float ∈ [0, f_max], где
+    f_max = min(our_float × 1.10, wear_category_max(our_float)); без
+    exterior-тега) и почему авто-цена выдала именно такую цифру.
     """
     try:
         import item_info as _ii
+        import price_suggest as _ps
     except ImportError as exc:  # pragma: no cover
-        print(f"   [BUG] item_info не загружен: {exc}")
+        print(f"   [BUG] item_info / price_suggest не загружен: {exc}")
         return
 
-    f_max = max(0.0, min(1.0, our_float * 1.10))
+    import price_suggest as _ps
+    f_max = min(our_float * 1.10, _ps.wear_category_max(our_float))
     cat_f: dict[str, list[str]] = {}
     if quality_tag:
         cat_f["category_730_Quality"] = [quality_tag]
@@ -5739,14 +5923,20 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
         except Exception as exc:  # noqa: BLE001
             print(f"   [!] histogram недоступен: {type(exc).__name__}: {exc}")
             return None
-        sell_table: list[tuple[int, int]] = []
-        for row in histogram.sell_order_table or ():
-            p = getattr(row, "price", None)
-            q = getattr(row, "quantity", None)
-            if p is not None and q is not None:
-                sell_table.append((int(p), int(q)))
+        # PR #5: full sell-стакан из `sell_order_graph` (до 100 уровней),
+        # а не `sell_order_table` (топ-6 с синтетическим «всё ≥ X» бакетом).
+        sell_table: list[tuple[int, int]] = _ii._graph_to_deltas(
+            histogram.sell_order_graph
+        )
         if not sell_table:
-            print("   [!] sell_order_table пустой.")
+            # Fallback: graph пустой — что-то возьмём из table.
+            for row in histogram.sell_order_table or ():
+                p = getattr(row, "price", None)
+                q = getattr(row, "quantity", None)
+                if p is not None and q is not None:
+                    sell_table.append((int(p), int(q)))
+        if not sell_table:
+            print("   [!] sell-стакан пустой.")
             return None
         sug = _ps.path_a_suggest(sell_table, daily, week)
         if sug.cents is None:
@@ -6580,6 +6770,45 @@ async def _bulk_cancel_cross_account(  # noqa: PLR0912, PLR0915, C901
     await _press_enter_to_continue()
 
 
+def _parse_sweep_filter(arg: str, accounts: list[dict]) -> set[int] | None:
+    """Парсит аргумент `r <arg>` для выборочного sweep'а.
+
+    Поддержка: `"35"`, `"1,5,7"`, `"1-10"`, `"1-5,9,15-20"`.
+    Возвращает множество label_num'ов, либо None если парсер споткнулся
+    (с диагностическим print'ом — вызывающий должен пропустить sweep).
+    """
+    valid_labels = {_label_num(a) for a in accounts if _label_num(a) is not None}
+    out: set[int] = set()
+    for part in arg.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                lo_s, hi_s = part.split("-", 1)
+                lo, hi = int(lo_s.strip()), int(hi_s.strip())
+            except ValueError:
+                print(f"   [!] не понял диапазон: {part!r}")
+                return None
+            if lo > hi:
+                lo, hi = hi, lo
+            for n in range(lo, hi + 1):
+                out.add(n)
+        else:
+            try:
+                out.add(int(part))
+            except ValueError:
+                print(f"   [!] не понял число: {part!r}")
+                return None
+    if not out:
+        print("   [!] пустой фильтр.")
+        return None
+    unknown = out - valid_labels
+    if unknown:
+        print(f"   [!] неизвестные label: {sorted(unknown)} (есть: {sorted(valid_labels)[:20]}...)")
+    return out
+
+
 async def _pick_account(
     accounts: list[dict],
     *,
@@ -6631,7 +6860,10 @@ async def _pick_account(
             print(f"  {key}) {acc['username']}{marker}{auto_marker}")
         print("  s) Сводка по всем аккаунтам (из кеша)")
         if sweep_callback is not None:
-            print("  r) Refresh всех (sweep: balance + orders + инвентари + дельта истории)")
+            print(
+                "  r) Refresh всех (sweep: balance + orders + инвентари + дельта истории)\n"
+                "     `r 35`, `r 1,5,7`, `r 1-10` — sweep только этих аккаунтов"
+            )
         if stats_callback is not None:
             print("  g) Глобальная статистика по инвентарям (cross-account)")
         if history_callback is not None:
@@ -6648,9 +6880,17 @@ async def _pick_account(
         if raw.lower() == "s":
             await _show_cache_summary()
             continue
-        if raw.lower() == "r" and sweep_callback is not None:
+        # PR #6: `r` — sweep всех; `r <args>` — выборочный sweep.
+        # args: одиночные label_num (`35`), список через запятую (`1,5,7`)
+        # и/или диапазоны (`1-10`). Перечисления комбинируются: `1-5,9,15-20`.
+        if (raw.lower() == "r" or raw.lower().startswith("r ")) and sweep_callback is not None:
+            arg = raw[1:].strip()
+            filter_nums = _parse_sweep_filter(arg, accounts) if arg else None
+            if arg and filter_nums is None:
+                # парсер вернул None ⇒ невалидный ввод; не запускаем sweep.
+                continue
             try:
-                await sweep_callback()
+                await sweep_callback(filter_nums)
             except Exception as exc:  # noqa: BLE001
                 print(f"[ERROR] sweep упал: {exc!r}")
                 traceback.print_exc()
@@ -6753,7 +6993,10 @@ async def _run() -> int:
         while True:
             account = await _pick_account(
                 accounts,
-                sweep_callback=lambda: _run_sweep(accounts, sessions, force_relogin),
+                sweep_callback=lambda flt=None: _run_sweep(
+                    accounts, sessions, force_relogin,
+                    filter_label_nums=flt,
+                ),
                 stats_callback=lambda: _show_global_stats(
                     accounts, sessions, force_relogin
                 ),
