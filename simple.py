@@ -998,6 +998,7 @@ async def _auto_suggest_price(
             exterior_tag=e_tag,
             currency_code=currency_code,
             daily_sales=daily,
+            week_pct=week,
         )
         if sug.cents is None:
             return None
@@ -5814,6 +5815,7 @@ async def _auto_price_group(  # noqa: PLR0912, PLR0915, C901
                 exterior_tag=e_tag,
                 currency_code=currency_code,
                 daily_sales=daily,
+                week_pct=week,
             )
             cents = sug_b.cents
             reason = sug_b.reason

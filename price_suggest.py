@@ -13,10 +13,18 @@ Path A: предмет без флоата (кейсы/наклейки/чарм
     один шаг к стенке (= первый rejected уровень).
 
 Path B: есть флоат, паттерн НЕ редкий.
-    Фильтр POST: float ≤ f_my * 1.10, та же quality/exterior, sort ASC.
-    Берём min_price + qty_at_min_price.
-    Если qty_at_min < daily_sales (стенка маленькая) → ставим РОВНО min.
-    Иначе → min − 0.01 (один шаг под минимум).
+    Фильтр POST: float ≤ f_my * 1.10, та же quality (без exterior), sort ASC.
+    Skip 0-price + outlier (<25% от next). Дальше — три сигнала:
+      density: spread топ-5 листингов (DENSE <3%, SPARSE >10%, иначе MEDIUM).
+      velocity: daily_sales (FAST ≥50, SLOW ≤5, иначе MED).
+      trend: week_pct (RISING >+5%, FALLING <−5%, иначе FLAT).
+    Решение (soft-max режим, см. PR #6):
+      - DENSE  → match anchor (без −0.01, стенка и так нас прокатит).
+      - SPARSE & p2>p1·1.05 → anchor=p2, undercut −0.01 (p1 "тонкий").
+      - иначе → anchor=p1, undercut −0.01.
+    Модификатор (мягкий, cap ±5%):
+      - RISING: +1% (+1% если SLOW).
+      - FALLING: −1% (−1% если FAST).
 
 Path C: редкий паттерн.
     Никакой автоматики — просим ввести цену вручную.
@@ -125,23 +133,23 @@ async def path_b_suggest(
     exterior_tag: str | None,
     currency_code: int,
     daily_sales: float,
+    week_pct: float | None = None,
 ) -> PathBSuggestion:
-    """Авто-цена для скина с флоатом (не редкий паттерн).
+    """Авто-цена для скина с флоатом (не редкий паттерн), soft-max режим.
 
     Делает POST на market-эндпоинт с фильтрами quality + float ∈ [0.0, our_float * 1.10].
     Exterior-тег (FN/MW/FT/...) намеренно НЕ используем: иначе у FT-скина фильтр
     обрежет листинги до FT (min float ≈ 0.15) и мы пропустим более дешёвые
     FN/MW-листинги с лучшим флоатом, которые уже конкурируют за того же покупателя.
 
-    Логика выбора цены:
-      1. Фильтруем листинги с price=0 (баг Steam).
-      2. Если первый валидный листинг < 25% от второго — outlier (опечатка/
-         дампер), скипаем и берём следующий.
-      3. min_price = buyer-facing цена оставшегося первого листинга.
-      4. suggest = min_price − 0.01 (always undercut, без условий по daily).
+    Алгоритм (см. docstring модуля, секция Path B):
+      1. Фильтруем 0-price листинги (баг Steam).
+      2. Outlier-фильтр: первый валидный < 25% от второго — пропускаем.
+      3. Считаем сигналы density / velocity / trend.
+      4. Выбираем anchor (p1 или p2 при SPARSE) и базу (match / undercut −0.01).
+      5. Применяем мягкий ±-модификатор (cap ±5%) от trend × velocity.
 
-    Возвращает суггест в центах + reason. Параметр `exterior_tag` оставлен ради
-    обратной совместимости и игнорируется.
+    Параметр `exterior_tag` оставлен ради обратной совместимости и игнорируется.
     """
     # Локальный импорт чтобы не тянуть item_info на верхний уровень.
     import item_info
@@ -207,29 +215,102 @@ async def path_b_suggest(
             outlier_skipped = p1
             valid = valid[1:]
 
-    min_price = _buyer_price(valid[0])
-    if min_price <= 0:
+    p1 = _buyer_price(valid[0])
+    if p1 <= 0:
         return PathBSuggestion(None, "не смог распарсить min_price")
 
-    # qty_at_min — для информации в reason'е. По новой логике always undercut
-    # она цену больше не определяет (раньше зависело от daily_sales).
-    qty_at_min = 0
-    for li in valid:
-        if _buyer_price(li) == min_price:
-            qty_at_min += 1
-        else:
-            break
+    # === Сигналы ===========================================================
+    # 1) density — насколько плотно стоят топ-5 листингов.
+    top_k = min(5, len(valid))
+    top_prices = [_buyer_price(li) for li in valid[:top_k]]
+    pk = top_prices[-1]
+    spread_pct = (pk - p1) * 100.0 / p1 if p1 > 0 else 0.0
+    if spread_pct < 3.0:
+        density = "DENSE"
+    elif spread_pct > 10.0:
+        density = "SPARSE"
+    else:
+        density = "MEDIUM"
 
-    suggest = max(1, min_price - 1)
-    parts = [
-        f"undercut min={min_price/100:.2f} −0.01 "
-        f"(qty {qty_at_min}, daily {daily_sales:.0f})"
-    ]
+    # 2) velocity — частота продаж.
+    if daily_sales >= 50:
+        velocity = "FAST"
+    elif daily_sales <= 5:
+        velocity = "SLOW"
+    else:
+        velocity = "MED"
+
+    # 3) trend — недельное изменение цены.
+    if week_pct is None:
+        trend = "FLAT"
+    elif week_pct > 5.0:
+        trend = "RISING"
+    elif week_pct < -5.0:
+        trend = "FALLING"
+    else:
+        trend = "FLAT"
+
+    # === Anchor (p1 либо p2 при разреженной выборке) =======================
+    anchor = p1
+    sparse_skip_p1 = False
+    if density == "SPARSE" and len(valid) >= 2:
+        p2 = _buyer_price(valid[1])
+        # p1 «тонкий» (≥5% дешевле p2) — ориентируемся на p2.
+        if p2 > p1 * 1.05:
+            anchor = p2
+            sparse_skip_p1 = True
+
+    # === База: match wall vs undercut =======================================
+    if density == "DENSE":
+        base = anchor  # стенка плотная — просто matchим её, не теряем 0.01.
+        base_op = "match"
+    else:
+        base = max(1, anchor - 1)
+        base_op = "undercut −0.01"
+
+    # === Модификатор: мягкий ± по тренду × velocity ========================
+    mod_pct = 0.0
+    if trend == "RISING":
+        mod_pct += 1.0
+        if velocity == "SLOW":
+            mod_pct += 1.0  # медленный рост — можно держать ВЫШЕ стенки
+    elif trend == "FALLING":
+        mod_pct -= 1.0
+        if velocity == "FAST":
+            mod_pct -= 1.0  # быстрый падающий рынок — агрессивнее уходим
+    # Cap ±5% чтобы не уезжать сильно в обе стороны.
+    if mod_pct > 5.0:
+        mod_pct = 5.0
+    elif mod_pct < -5.0:
+        mod_pct = -5.0
+
+    final = base
+    if mod_pct != 0.0:
+        final = max(1, int(round(base * (1.0 + mod_pct / 100.0))))
+
+    # === Reason для таблицы =================================================
+    sig = f"{density}·{velocity}·{trend}"
+    parts = [sig]
+    if sparse_skip_p1:
+        parts.append(
+            f"anchor=p2={anchor/100:.2f} (skip thin p1={p1/100:.2f})"
+        )
+    else:
+        parts.append(f"anchor=p1={p1/100:.2f}")
+    parts.append(f"{base_op}={base/100:.2f}")
+    if mod_pct != 0.0:
+        parts.append(f"mod {mod_pct:+.0f}%")
+    parts.append(f"→ {final/100:.2f}")
+    week_str = f"{week_pct:+.1f}%" if week_pct is not None else "?"
+    parts.append(
+        f"(spread={spread_pct:.1f}% daily={daily_sales:.0f} week={week_str})"
+    )
+    reason = " ".join(parts)
     if zero_skipped:
-        parts.append(f"skip {zero_skipped}× price=0")
+        reason += f"; skip {zero_skipped}× price=0"
     if outlier_skipped is not None:
-        parts.append(f"skip outlier={outlier_skipped/100:.2f}")
-    return PathBSuggestion(suggest, "; ".join(parts))
+        reason += f"; skip outlier={outlier_skipped/100:.2f}"
+    return PathBSuggestion(final, reason)
 
 
 # =============================================================================
