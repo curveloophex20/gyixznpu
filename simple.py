@@ -646,6 +646,34 @@ async def _paginate(
                     + " / Enter"
                 )
                 continue
+            # Multi-select: «s 1,2,3» = вызвать handler последовательно для
+            # каждого индекса. Пробелы вокруг запятой допустимы.
+            tail_clean = tail.replace(" ", "")
+            if "," in tail_clean:
+                parts_n = [p for p in tail_clean.split(",") if p]
+                try:
+                    indices = [int(p) for p in parts_n]
+                except ValueError:
+                    print(
+                        f"   Команда «{head_l}» ждёт номера, например: "
+                        f"{head_l} 3 или {head_l} 1,2,3"
+                    )
+                    continue
+                bad = [n for n in indices if not (1 <= n <= len(items))]
+                if bad:
+                    print(f"   Номера вне диапазона 1..{len(items)}: {bad}")
+                    continue
+                print(
+                    f"   [multi] {head_l} × {len(indices)}: {indices} "
+                    f"(каждый — отдельный шаг)"
+                )
+                for idx_1b in indices:
+                    try:
+                        await handler(items[idx_1b - 1], idx_1b, items)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"   [ERROR на #{idx_1b}] {exc!r}")
+                        traceback.print_exc()
+                continue
             try:
                 idx_1b = int(tail)
             except ValueError:
@@ -779,6 +807,39 @@ async def _paginate_lazy(
                     + " / ".join(f"{k} <N>" for k in extra_commands.keys())
                     + " / Enter"
                 )
+                continue
+            tail_clean = tail.replace(" ", "")
+            if "," in tail_clean:
+                parts_n = [p for p in tail_clean.split(",") if p]
+                try:
+                    indices = [int(p) for p in parts_n]
+                except ValueError:
+                    print(
+                        f"   Команда «{head_l}» ждёт номера, например: "
+                        f"{head_l} 3 или {head_l} 1,2,3"
+                    )
+                    continue
+                bad = [n for n in indices if not (1 <= n <= total)]
+                if bad:
+                    print(f"   Номера вне диапазона 1..{total}: {bad}")
+                    continue
+                missing = [n for n in indices if loaded.get(n - 1) is None]
+                if missing:
+                    print(
+                        f"   Элементы #{missing} ещё не загружены — пролистай "
+                        "на нужные страницы и повтори команду."
+                    )
+                    continue
+                print(
+                    f"   [multi] {head_l} × {len(indices)}: {indices} "
+                    f"(каждый — отдельный шаг)"
+                )
+                for idx_1b in indices:
+                    try:
+                        await handler(loaded[idx_1b - 1], idx_1b, loaded)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"   [ERROR на #{idx_1b}] {exc!r}")
+                        traceback.print_exc()
                 continue
             try:
                 idx_1b = int(tail)
@@ -2274,10 +2335,15 @@ def _group_inventory(
             except (TypeError, ValueError):
                 newest = 0
             worst_hold = None
+            min_hold = None
             for it in lst:
                 ta = getattr(it, "tradable_after", None)
-                if ta is not None and (worst_hold is None or ta > worst_hold):
+                if ta is None:
+                    continue
+                if worst_hold is None or ta > worst_hold:
                     worst_hold = ta
+                if min_hold is None or ta < min_hold:
+                    min_hold = ta
             bucket.append(
                 {
                     "name": name,
@@ -2285,6 +2351,7 @@ def _group_inventory(
                     "total_amount": total_amount,
                     "newest": newest,
                     "worst_hold": worst_hold,
+                    "min_hold": min_hold,
                     "section": state,
                 }
             )
@@ -2302,7 +2369,11 @@ def _print_inventory_group(i: int, group: dict) -> None:
         # Несколько разных asset_id (CS2-скины с разным float/seed) — не классический stack.
         extra = f"  (разных: {n_unique})"
     state = group.get("section", "free")
-    state_str = _format_state_marker(state, group.get("worst_hold"))
+    # Для trade-hold/protect показываем ближайший разлок (min_hold) — это
+    # «следующий освободится через …». Раньше показывали worst_hold (последний),
+    # но юзеру полезнее ждать ближайший.
+    hold_ts = group.get("min_hold") or group.get("worst_hold")
+    state_str = _format_state_marker(state, hold_ts)
     print(f"   {i:>3}. {name} ×{total}{extra}{state_str}")
 
 
@@ -2779,19 +2850,10 @@ async def _show_inventory_generic(
         await _paginate(items_subset, INVENTORY_PAGE_SIZE, _render, extra_commands=extra)
 
     groups = _group_inventory(items, listed_asset_ids, protected_asset_ids)
-    # Если все предметы уникальны (ни одного дубля по нейму) — сразу плоский режим.
-    if len(groups) == len(items):
-        await _show_flat(items)
-        return
 
-    # Сводка по секциям — что вообще есть в инвентаре.
-    counts = {s: 0 for s in _SECTION_ORDER}
-    for g in groups:
-        counts[g["section"]] += g["total_amount"]
-    summary_parts = [f"{_SECTION_LABELS[s]}: {counts[s]}" for s in _SECTION_ORDER if counts[s]]
-    print(f"\nСгруппировано: {len(groups)} групп из {len(items)} предметов.")
-    if summary_parts:
-        print("   " + " | ".join(summary_parts))
+    # Если в инвентаре вообще нет дублей — всё равно показываем меню секций,
+    # чтобы пользователь сразу видел, что где (Свободные / На маркете / TH / TP).
+    # Старая ветка «если все уникальны — flat сразу» убрана: юзер просил группы.
 
     async def _expand_action(group, idx_1b: int, _all_groups):
         await _show_flat(group["items"], header=f"{group['name']} ({len(group['items'])} шт.)")
@@ -2813,36 +2875,59 @@ async def _show_inventory_generic(
             protected_asset_ids=protected_asset_ids,
         )
 
-    def _render_groups(slice_, start_idx):
-        last_section: str | None = None
-        for i, group in enumerate(slice_, start=start_idx):
-            section = group["section"]
-            if section != last_section:
-                if last_section is not None:
-                    print()
-                print(f"   --- {_SECTION_LABELS[section]} ---")
-                last_section = section
-            _print_inventory_group(i, group)
+    async def _show_section(section: str) -> None:
+        """Показывает одну секцию: либо flat (если уникальные), либо grouped."""
+        sec_groups = [g for g in groups if g["section"] == section]
+        sec_items = [it for g in sec_groups for it in g["items"]]
+        label_s = _SECTION_LABELS[section]
+        if not sec_items:
+            print(f"   (в секции «{label_s}» пусто)")
+            return
+        # Если внутри секции дублей нет — flat сразу удобнее.
+        if len(sec_groups) == len(sec_items):
+            await _show_flat(sec_items, header=label_s)
+            return
 
-    extra = {"e": _expand_action}
-    print("   `e <номер>` — развернуть группу в плоский список (и там можно `s <N>`).")
-    if sellable:
-        # `s <N>` — выставление группы (раньше было `b`, переименовано задачей 10).
-        # Сценарий теперь как у cross-account bulk-list: спрашиваем сколько штук,
-        # min_float, цену (с `i=инфо` callback) — а не «всю группу одной кнопкой».
-        extra["s"] = _bulk_list_action
-        print(
-            "   `s <номер>` — выставить часть группы по одной цене "
-            "(спрошу сколько штук, min float, цену; i=инфо/график)."
+        def _render_section_groups(slice_, start_idx):
+            print(f"\n   --- {label_s} ---")
+            for i, group in enumerate(slice_, start=start_idx):
+                _print_inventory_group(i, group)
+
+        sec_extra = {"e": _expand_action}
+        hints = ["e <N> — развернуть группу в плоский список"]
+        if sellable and section == "free":
+            sec_extra["s"] = _bulk_list_action
+            hints.append(
+                "s <N> — выставить часть группы (можно s 1,2,3 — последовательно)"
+            )
+        print("\n   " + "  /  ".join(hints))
+        await _paginate(
+            sec_groups,
+            max(len(sec_groups), 1),
+            _render_section_groups,
+            extra_commands=sec_extra,
         )
-    # Сгруппированный вид показываем без пагинации — групп обычно мало,
-    # листать неудобно (#6 в фидбеке).
-    await _paginate(
-        groups,
-        max(len(groups), 1),
-        _render_groups,
-        extra_commands=extra,
-    )
+
+    # Главное меню секций — пока не введут 0/Enter, гоняем выбор группы.
+    counts = {s: 0 for s in _SECTION_ORDER}
+    for g in groups:
+        counts[g["section"]] += g["total_amount"]
+
+    while True:
+        print("\n" + "=" * 80)
+        print(f"   {label} — выбери группу")
+        print("=" * 80)
+        for i, s in enumerate(_SECTION_ORDER, 1):
+            print(f"   {i}) {_SECTION_LABELS[s]:<40}— {counts[s]} предметов")
+        print("   0) Назад")
+        choice = (await _ask("\nВыбор: ")).strip()
+        if choice in ("", "0", "q", "b"):
+            return
+        if choice not in {"1", "2", "3", "4"}:
+            print("Не понял.")
+            continue
+        sec_idx = int(choice) - 1
+        await _show_section(_SECTION_ORDER[sec_idx])
 
 
 async def menu_inventory(client, currency_enum, currency_code: int) -> None:
@@ -4332,36 +4417,53 @@ async def _show_recently_unlocked(
     from collections import defaultdict
     by_name: dict[str, list[dict]] = defaultdict(list)
     name_to_appctx: dict[str, str] = {}
+    per_acc_by_name: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for r in recently:
         nm = r.get("market_hash_name") or "?"
         by_name[nm].append(r)
         name_to_appctx[nm] = r.get("app_context") or ""
+        per_acc_by_name[nm][r["username"]] += int(r.get("amount") or 1)
 
-    # (name, qty_recent, accounts_count_recent)
-    grouped: list[tuple[str, int, int]] = []
+    def _short_acc(u: str) -> str:
+        raw = (label_lookup or {}).get(u, "")
+        if raw and raw.isdigit():
+            return raw
+        return u
+
+    def _examples_for(nm: str) -> str:
+        accs = sorted(per_acc_by_name[nm].items(), key=lambda x: -x[1])
+        parts = [f"{_short_acc(u)}×{q}" for u, q in accs[:5]]
+        if len(accs) > 5:
+            parts.append(f"+{len(accs) - 5}")
+        return ", ".join(parts)
+
+    # (name, qty_recent, accounts_count_recent, examples)
+    grouped: list[tuple[str, int, int, str]] = []
     for nm, rs in by_name.items():
-        grouped.append((nm, len(rs), len({rr["username"] for rr in rs})))
+        grouped.append(
+            (nm, len(rs), len({rr["username"] for rr in rs}), _examples_for(nm))
+        )
     grouped.sort(key=lambda x: -x[1])
 
     accounts_lookup = {a["username"]: a for a in accounts}
 
     def _render(items_slice, start_idx):
-        print("\n" + "─" * 92)
+        print("\n" + "─" * 110)
         print(
             f"   Недавно разлочены (≤3 дня, {source}): "
             f"{len(grouped)} уник. имён, {len(recently)} предметов (cross-account)"
         )
-        print("─" * 92)
+        print("─" * 110)
         print(
-            f"   {'#':<4} {'Имя':<50}  {'qty(новые)':<11}  {'аккаунтов':<10}"
+            f"   {'#':<4} {'Имя':<46}  {'qty':<5}  {'аккаунтов':<10}  Примеры"
         )
-        print("─" * 92)
-        for i, (nm, qty, accs_n) in enumerate(items_slice, start_idx):
-            short = nm if len(nm) <= 50 else nm[:47] + "..."
-            print(f"   {i:<4} {short:<50}  {qty:<11}  {accs_n:<10}")
-        print("─" * 92)
+        print("─" * 110)
+        for i, (nm, qty, accs_n, examples) in enumerate(items_slice, start_idx):
+            short = nm if len(nm) <= 46 else nm[:43] + "..."
+            print(f"   {i:<4} {short:<46}  {qty:<5}  {accs_n:<10}  {examples}")
+        print("─" * 110)
         print(
-            "   s <N> — bulk-list по имени (выставить N экз. с разных аккаунтов; "
+            "   s <N> — bulk-list по имени (можно s 1,2,3 — последовательно; "
             "берёт ВСЕ state=free, не только недавно разлоченные)"
         )
 
@@ -4895,19 +4997,13 @@ async def _show_global_stats(
             counts[label] = sum(1 for r in _cache.iter_inventory(app_context=ctx_str))
         for i, (label, ctx_str) in enumerate(_GAME_GROUPS, 1):
             print(f"   {i}) {label:<14}— {counts[label]} предметов (в кеше)")
-        print("   u) Недавно разлочены (≤3 дня, cross-account; diff публичный vs приватный)")
         print("   0) Назад")
-        choice = (await _ask("\nВыбор: ")).strip()
+        print(
+            "   (Недавно разлочены теперь внутри CS2 — выбери 2) CS2 → пункт 5)\n"
+        )
+        choice = (await _ask("Выбор: ")).strip()
         if choice == "0" or choice == "":
             return
-        if choice.lower() == "u":
-            await _show_recently_unlocked(
-                accounts=accounts or [],
-                sessions=sessions or {},
-                force_relogin=force_relogin,
-                label_lookup=label_lookup,
-            )
-            continue
         if choice not in {"1", "2", "3", "4"}:
             print("Не понял.")
             continue
@@ -4956,6 +5052,11 @@ async def _show_cs2_subgroups(
         c = Counter(r.get("state") or "?" for r in rows)
         for i, (label, state_val) in enumerate(_CS2_STATE_GROUPS, 1):
             print(f"   {i}) {label:<35}— {c.get(state_val, 0)} предметов")
+        recently_n = sum(1 for r in rows if r.get("hidden_from_public"))
+        print(
+            f"   5) Недавно разлочены (≤3 дня, public-diff){' ' * 1}— "
+            f"{recently_n} предметов"
+        )
         unknown = c.get("?", 0)
         if unknown:
             print(f"   (state=NULL у {unknown} строк — пройдись sweep'ом ещё раз)")
@@ -4963,6 +5064,14 @@ async def _show_cs2_subgroups(
         choice = (await _ask("\nВыбор: ")).strip()
         if choice == "0" or choice == "":
             return
+        if choice == "5":
+            await _show_recently_unlocked(
+                accounts=accounts or [],
+                sessions=sessions or {},
+                force_relogin=force_relogin,
+                label_lookup=label_lookup or {},
+            )
+            continue
         if choice not in {"1", "2", "3", "4"}:
             print("Не понял.")
             continue
@@ -5091,35 +5200,83 @@ async def _show_grouped_items(
                     f"{_fmt_price_for_row(min_p, cc)} – {_fmt_price_for_row(max_p, cc)}"
                 )
 
+    # Для trade-hold/protect-выборки считаем «ближайший разлок» (min tradable_after)
+    # по каждому имени — пользователю полезнее знать, когда ОДИН экземпляр выйдет.
+    name_to_min_unlock_str: dict[str, str] = {}
+    if state_filter in ("trade_hold", "trade_protect"):
+        from datetime import datetime, timezone
+        now_u = datetime.now(timezone.utc)
+        by_name_ta: dict[str, datetime] = {}
+        for r in rows:
+            ta_raw = r.get("tradable_after")
+            if not ta_raw:
+                continue
+            try:
+                ta = datetime.fromisoformat(str(ta_raw))
+            except (ValueError, TypeError):
+                continue
+            if ta.tzinfo is None:
+                ta = ta.replace(tzinfo=timezone.utc)
+            nm = r.get("market_hash_name") or ""
+            cur = by_name_ta.get(nm)
+            if cur is None or ta < cur:
+                by_name_ta[nm] = ta
+        label_hold = "trade-protected" if state_filter == "trade_protect" else "trade-hold"
+        for nm, ta in by_name_ta.items():
+            sec = int((ta - now_u).total_seconds())
+            if sec <= 0:
+                name_to_min_unlock_str[nm] = f"[{label_hold} разлок сейчас]"
+                continue
+            days = sec // 86400
+            hours = (sec % 86400) // 3600
+            if days > 0:
+                name_to_min_unlock_str[nm] = f"[{label_hold} ещё {days}д {hours}ч]"
+            else:
+                name_to_min_unlock_str[nm] = f"[{label_hold} ещё {hours}ч]"
+
+    show_unlock = bool(name_to_min_unlock_str)
+
     def _render(items_slice, start_idx_1based):
-        print("\n" + "─" * 110)
+        width = 140 if show_unlock else 110
+        print("\n" + "─" * width)
         print(f"   {title}: {len(grouped)} уник. имён, всего {sum(g[1] for g in grouped)} шт.")
-        print("─" * 110)
+        print("─" * width)
         if has_on_market:
             print(
                 f"   {'#':<4} {'Имя':<40}  {'qty':<5}  {'акки':<5}  "
                 f"{'цена':<16}  Примеры"
             )
+        elif show_unlock:
+            print(
+                f"   {'#':<4} {'Имя':<46}  {'qty':<5}  {'акк':<5}  "
+                f"{'Примеры':<28}  ближайший разлок"
+            )
         else:
             print(
                 f"   {'#':<4} {'Имя':<46}  {'qty':<5}  {'аккаунтов':<10}  Примеры"
             )
-        print("─" * 110)
+        print("─" * width)
         for i, (name, total, accs_n, examples) in enumerate(items_slice, start_idx_1based):
             if has_on_market:
                 short_name = name if len(name) <= 40 else name[:37] + "..."
                 price_col = name_to_pricerange.get(name, "—")
                 print(f"   {i:<4} {short_name:<40}  {total:<5}  {accs_n:<5}  "
                       f"{price_col:<16}  {examples}")
+            elif show_unlock:
+                short_name = name if len(name) <= 46 else name[:43] + "..."
+                unlock_col = name_to_min_unlock_str.get(name, "—")
+                ex_short = examples if len(examples) <= 28 else examples[:25] + "..."
+                print(f"   {i:<4} {short_name:<46}  {total:<5}  {accs_n:<5}  "
+                      f"{ex_short:<28}  {unlock_col}")
             else:
                 short_name = name if len(name) <= 46 else name[:43] + "..."
                 print(f"   {i:<4} {short_name:<46}  {total:<5}  {accs_n:<10}  {examples}")
-        print("─" * 110)
+        print("─" * width)
         hints = ["i <N> — детали (+ лоты по цене)"]
         if has_free:
-            hints.append("s <N> — выставить N (free)")
+            hints.append("s <N> — выставить N (free; можно s 1,2,3)")
         if has_on_market:
-            hints.append("c <N> — снять N с продажи (on_market)")
+            hints.append("c <N> — снять N с продажи (on_market; можно c 1,2,3)")
         print("   " + "  /  ".join(hints))
 
     # `i <N>` — детали по имени с лотами (по цене) для on_market.
